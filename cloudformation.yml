@@ -1,0 +1,312 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Stock Data Automation Pipeline - An ETL Pipeline for stock data using Lambda and Glue.
+
+Parameters:
+  NotificationBucket:
+    Type: String
+    Description: S3 bucket that's used for the Lambda event notification
+
+  EmailAddress:
+    Type: String
+    ConstraintDescription: Email address required.
+    Description: Enter an email address you want to subscribe to the Amazon SNS topic that will send notifications if your account's AWS root user logs in.
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group Id
+
+Resources:
+  FetchDataFromApiInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-051f8a213df8bc089
+      InstanceType: t2.micro
+      KeyName: term_assignment_kp
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+
+  MyApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: get_Stock_data_using_cf
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref MyApiGateway
+      ParentId: !GetAtt MyApiGateway.RootResourceId
+      PathPart: 'request_data_for_a_stock'
+
+  LambdaPandasLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleArchitectures:
+        - x86_64
+      LayerName: lambda-pandas-layer-using-cf
+      Description: Pandas package layer created using Cloudformation
+      Content:
+        S3Bucket: Your_Bucket_Name_here
+        S3Key: pandas_package.zip
+      CompatibleRuntimes:
+        - python3.11
+
+
+  LambdaFunctionGetStockData:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: get_stock_data_using_cf
+      Code:
+        S3Bucket: Your_S3_Bucket_Name
+        S3Key: lambda_function_for_getting_stock_data.zip #This zip will contain lambda code used for getting data from API Gateway.
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::637423211313:role/LabRole
+      Runtime: python3.11
+      Timeout: 300
+      Layers:
+        - !Ref LambdaPandasLayer
+
+  TriggerGetStockDataLambdaFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:invokeFunction'
+      FunctionName: !Ref LambdaFunctionGetStockData
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MyApiGateway}/*/POST/request_data_for_a_stock'
+
+
+  ApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ApiKeyRequired: false
+      AuthorizationType: NONE
+      RestApiId: !Ref MyApiGateway
+      ResourceId: !Ref ApiGatewayResource
+      HttpMethod: POST
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunctionGetStockData.Arn}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: '200'
+#        RequestTemplates:
+#          application/json: "{\"statusCode\":200}"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+  ApiGatewayDeployment:
+    DependsOn: ApiGatewayMethod
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      RestApiId: !Ref MyApiGateway
+      StageName: dev
+
+  LambdaFunctionTriggerGlueJob:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: trigger_glue_job_using_cf
+      Code:
+        S3Bucket: Your_S3_Bucket_Name
+        S3Key: trigger_glue_job.zip
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::637423211313:role/LabRole
+      Runtime: python3.11
+      Timeout: 300
+
+  TriggerGlueJobLambdaFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:invokeFunction'
+      FunctionName: !Ref LambdaFunctionTriggerGlueJob
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'Your S3 Bucket ARN here'
+      SourceAccount: !Ref AWS::AccountId
+
+  CustomResourceLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: arn:aws:iam::637423211313:role/LabRole
+      Code:
+        ZipFile: |
+          
+          from __future__ import print_function
+          import json
+          import boto3
+          import cfnresponse
+          
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+          
+          print('Loading function')
+          s3 = boto3.resource('s3')
+          
+          def lambda_handler(event, context):
+              print("Received event: " + json.dumps(event, indent=2))
+              responseData={}
+              try:
+                  if event['RequestType'] == 'Delete':
+                      print("Request Type:",event['RequestType'])
+                      Bucket=event['ResourceProperties']['Bucket']
+                      delete_notification(Bucket)
+                      print("Sending response to custom resource after Delete")
+                  elif event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      print("Request Type:",event['RequestType'])
+                      LambdaArn=event['ResourceProperties']['LambdaArn']
+                      Bucket=event['ResourceProperties']['Bucket']
+                      add_notification(LambdaArn, Bucket)
+                      responseData={'Bucket':Bucket}
+                      print("Sending response to custom resource")
+                  responseStatus = 'SUCCESS'
+              except Exception as e:
+                  print('Failed to process:', e)
+                  responseStatus = 'FAILED'
+                  responseData = {'Failure': 'Something bad happened.'}
+              cfnresponse.send(event, context, responseStatus, responseData, "CustomResourcePhysicalID")
+          
+          def add_notification(LambdaArn, Bucket):
+              bucket_notification = s3.BucketNotification(Bucket)
+              response = bucket_notification.put(
+                NotificationConfiguration={
+                  'LambdaFunctionConfigurations': [
+                    {
+                        'LambdaFunctionArn': LambdaArn,
+                        'Events': [
+                            's3:ObjectCreated:*'
+                        ]
+                    }
+                  ]
+                }
+              )
+              print("Put request completed....")
+          
+          def delete_notification(Bucket):
+              bucket_notification = s3.BucketNotification(Bucket)
+              response = bucket_notification.put(
+                  NotificationConfiguration={}
+              )
+              print("Delete request completed....")
+      Runtime: python3.9
+      Timeout: 50
+
+  LambdaTrigger:
+    Type: 'Custom::LambdaTrigger'
+    DependsOn: TriggerGlueJobLambdaFunctionPermission
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      LambdaArn: !GetAtt LambdaFunctionTriggerGlueJob.Arn
+      Bucket: !Ref NotificationBucket
+
+  GlueJob1:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: "etl_glue_job_using_cf"
+      Command:
+        Name: pythonshell
+        PythonVersion: '3.9'
+        ScriptLocation:
+          !Sub "s3://aws-glue-assets-${AWS::AccountId}-${AWS::Region}/scripts/etl_glue_job.py"
+      MaxCapacity: 0.0625
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxRetries: 0
+      Role: arn:aws:iam::637423211313:role/LabRole
+      Timeout: 10
+
+  GlueJobNotificationSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint:
+            Ref: EmailAddress
+          Protocol: email
+      TopicName: GlueJobNotificationUsingCf
+
+  EventTopicPolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: '*'
+      Topics:
+        - !Ref GlueJobNotificationSNSTopic
+
+  SNSEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'sns_notification_using_cf'
+      State: ENABLED
+      EventPattern: |
+        { 
+        "detail-type": ["Glue Job State Change", "Glue Job Run Status"],
+        "source": ["aws.glue"],
+        "detail": {
+        "state": ["FAILED", "SUCCEEDED", "TIMEOUT", "STOPPED"] } }
+      Targets:
+        - Id: "GlueJobNotificationsSNSTopic"
+          Arn: !Ref GlueJobNotificationSNSTopic
+
+  StockDataAPISecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: 'API_Key_Secret'
+      SecretString: 'Your_API_Key_Here'
+
+  AthenaDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: stock_data_db_using_cf
+
+  AthenaTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref AthenaDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: stock_data_using_cf
+        Description: Stock Data Table
+#        Parameters:
+#          classification: json
+        StorageDescriptor:
+          Columns:
+            - Name: date
+              Type: date
+            - Name: symbol
+              Type: string
+            - Name: open
+              Type: double
+            - Name: high
+              Type: double
+            - Name: low
+              Type: double
+            - Name: close
+              Type: double
+            - Name: volume
+              Type: double
+          Location: s3://Your_S3_Bucket_Name/csv/
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+            Parameters:
+#              separatorChar: ','
+              serialization.format: ','
+              field.delim: ','
+          Compressed: false
+          NumberOfBuckets: 0
+          StoredAsSubDirectories: false
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          EXTERNAL: TRUE
+          skip.header.line.count: '1'
